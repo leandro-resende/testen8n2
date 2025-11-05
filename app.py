@@ -1,10 +1,10 @@
 import re
 import fitz  # PyMuPDF
 from typing import List
-import pandas as pd
 import argparse
 import json
 import os
+import sys
 
 from flask import Flask, request, jsonify
 
@@ -78,11 +78,12 @@ def is_blue(rgb, b_min=80, delta=10):
     return (b > b_min) and (b > r + delta) and (b > g + delta)
 
 
-def _extract_codes_from_doc(doc) -> pd.DataFrame:
+def _extract_codes_from_doc(doc) -> list[dict]:
     """
     Lógica comum de extração a partir de um objeto doc do PyMuPDF.
+    Retorna uma lista de dicts (rows).
     """
-    rows = []
+    rows: list[dict] = []
     # regex para P1..P50 (P + número de 1 a 50)
     ponto_regex = re.compile(r"^P(?:[1-9]|[1-4]\d|50)$", re.IGNORECASE)
 
@@ -177,19 +178,20 @@ def _extract_codes_from_doc(doc) -> pd.DataFrame:
                         })
 
     # Deduplicação (page + code + bbox arredondado)
-    uniq, seen = [], set()
+    uniq: list[dict] = []
+    seen: set = set()
     for r in rows:
-        bbox = r["bbox"] or (0, 0, 0, 0)
-        key = (r["page"], r["code"], tuple(round(float(x), 1) for x in bbox))
+        bbox = r.get("bbox") or (0, 0, 0, 0)
+        key = (r.get("page"), r.get("code"), tuple(round(float(x), 1) for x in bbox))
         if key in seen:
             continue
         seen.add(key)
         uniq.append(r)
 
-    return pd.DataFrame(uniq)
+    return uniq
 
 
-def extract_codes_from_path(pdf_path: str) -> pd.DataFrame:
+def extract_codes_from_path(pdf_path: str) -> list[dict]:
     """
     Versão para usar com caminho em disco (CLI).
     """
@@ -200,7 +202,7 @@ def extract_codes_from_path(pdf_path: str) -> pd.DataFrame:
         doc.close()
 
 
-def extract_codes_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
+def extract_codes_from_bytes(pdf_bytes: bytes) -> list[dict]:
     """
     Versão para usar com bytes (upload do n8n/Render).
     """
@@ -211,18 +213,13 @@ def extract_codes_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
         doc.close()
 
 
-# ================== MODO LINHA DE COMANDO (opcional, para testes) ==================
+# ================== MODO LINHA DE COMANDO (opcional, para testes locais) ==================
 
-def main():
+def main_cli():
     parser = argparse.ArgumentParser(
         description="Extrai spans VERDES (estruturas) e AZUIS (P1..P50) de um PDF."
     )
     parser.add_argument("pdf", help="Caminho do arquivo PDF de entrada")
-    parser.add_argument(
-        "--csv",
-        help="Caminho para salvar o resultado em CSV (opcional)",
-        default=None
-    )
     parser.add_argument(
         "--json",
         help="Caminho para salvar o resultado em JSON (opcional)",
@@ -238,27 +235,23 @@ def main():
         return
 
     print(f"Lendo PDF: {pdf_path}")
-    df = extract_codes_from_path(pdf_path)
+    rows = extract_codes_from_path(pdf_path)
 
-    if df.empty:
+    if not rows:
         print("Nenhum span verde/azul foi encontrado.")
         return
 
-    # Mostra um resumo no console
-    print(f"\nTotal de spans encontrados: {len(df)}\n")
-    print(df[["page", "code", "span_text", "bbox", "rgb"]].to_string(index=False))
+    print(f"\nTotal de spans encontrados: {len(rows)}\n")
+    for r in rows:
+        print(
+            f"pág {r['page']:<3} | code={r['code']:<15} | "
+            f"text={r['span_text']!r} | bbox={r['bbox']} | rgb={r['rgb']}"
+        )
 
-    # Salvar em CSV
-    if args.csv:
-        df.to_csv(args.csv, index=False)
-        print(f"\nResultado salvo em CSV: {args.csv}")
-
-    # Salvar em JSON (com todos os campos, inclusive span_raw)
     if args.json:
-        data = df.to_dict(orient="records")
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"Resultado salvo em JSON: {args.json}")
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        print(f"\nResultado salvo em JSON: {args.json}")
 
 
 # ================== FLASK APP PARA O N8N/RENDER ==================
@@ -286,9 +279,9 @@ def extract_endpoint():
     if not pdf_bytes:
         return jsonify({"error": "arquivo vazio"}), 400
 
-    df = extract_codes_from_bytes(pdf_bytes)
+    rows = extract_codes_from_bytes(pdf_bytes)
 
-    if df.empty:
+    if not rows:
         return jsonify({
             "codes": [],
             "points": [],
@@ -296,35 +289,27 @@ def extract_endpoint():
         })
 
     # Estruturas VERDES
-    codes = (
-        df[df["span_type"] == "code"]["code"]
-        .dropna()
-        .map(str)
-        .str.strip()
-        .unique()
-        .tolist()
-    )
-    codes = sorted(set(codes))
+    codes_set = {
+        str(r.get("code", "")).strip()
+        for r in rows
+        if r.get("span_type") == "code" and r.get("code")
+    }
+    codes = sorted(codes_set)
 
     # Pontos AZUIS P1..P50
-    points = (
-        df[df["span_type"] == "point"]["code"]
-        .dropna()
-        .map(str.upper)
-        .str.strip()
-        .unique()
-        .tolist()
-    )
+    points_set = {
+        str(r.get("code", "")).strip().upper()
+        for r in rows
+        if r.get("span_type") == "point" and r.get("code")
+    }
 
-    def point_key(p):
+    def point_key(p: str) -> int:
         try:
             return int(p[1:])
         except Exception:
             return 9999
 
-    points = sorted(points, key=point_key)
-
-    rows = df.to_dict(orient="records")
+    points = sorted(points_set, key=point_key)
 
     return jsonify({
         "codes": codes,
@@ -334,13 +319,9 @@ def extract_endpoint():
 
 
 if __name__ == "__main__":
-    # Rodando localmente: python app.py arquivo.pdf  (modo CLI)
-    # ou: python app.py  (subindo o servidor Flask na porta 8000)
-    import sys
-
-    # Se for chamado com argumentos, usa o modo CLI
-    if len(sys.argv) > 1 and sys.argv[1].endswith(".pdf"):
-        main()
+    # Se chamado com argumento .pdf: modo CLI
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith(".pdf"):
+        main_cli()
     else:
         port = int(os.getenv("PORT", "8000"))
         app.run(host="0.0.0.0", port=port)
